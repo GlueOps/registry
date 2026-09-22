@@ -1,0 +1,970 @@
+diff --git a/registry/proxy/proxyauth.go b/registry/proxy/proxyauth.go
+index 23b1e90..06993ca 100644
+--- a/registry/proxy/proxyauth.go
++++ b/registry/proxy/proxyauth.go
+@@ -1,6 +1,7 @@
+ package proxy
+ 
+ import (
++	"context"
+ 	"net"
+ 	"net/http"
+ 	"net/url"
+@@ -73,7 +74,13 @@ func getAuthURLs(remoteURL string) ([]string, error) {
+ 		return nil, err
+ 	}
+ 
+-	resp, err := http.Get(remoteURL + "/v2/")
++	ctx, cancel := context.WithTimeout(context.Background(), upstreamPingTimeout)
++	defer cancel()
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, remoteURL+"/v2/", nil)
++	if err != nil {
++		return nil, err
++	}
++	resp, err := http.DefaultClient.Do(req)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -131,8 +138,14 @@ func registrableDomain(host string) string {
+ 	return domain
+ }
+ 
+-func ping(manager challenge.Manager, endpoint, versionHeader string) error {
+-	resp, err := http.Get(endpoint)
++func ping(ctx context.Context, manager challenge.Manager, endpoint, versionHeader string) error {
++	ctx, cancel := context.WithTimeout(ctx, upstreamPingTimeout)
++	defer cancel()
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return err
++	}
++	resp, err := http.DefaultClient.Do(req)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/registry/proxy/proxymanifeststore_test.go b/registry/proxy/proxymanifeststore_test.go
+index 063d805..0243a9f 100644
+--- a/registry/proxy/proxymanifeststore_test.go
++++ b/registry/proxy/proxymanifeststore_test.go
+@@ -83,6 +83,13 @@ func (m *mockChallenger) challengeManager() challenge.Manager {
+ 	return nil
+ }
+ 
++func (m *mockChallenger) skipUpstream() bool {
++	return false
++}
++
++func (m *mockChallenger) noteRemote(context.Context, error) {
++}
++
+ func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestEnv {
+ 	nameRef, err := reference.WithName(name)
+ 	if err != nil {
+diff --git a/registry/proxy/proxyregistry.go b/registry/proxy/proxyregistry.go
+index e85663e..23d09ba 100644
+--- a/registry/proxy/proxyregistry.go
++++ b/registry/proxy/proxyregistry.go
+@@ -2,7 +2,9 @@ package proxy
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
++	"net"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+@@ -25,6 +27,18 @@ import (
+ 
+ var repositoryTTL = 24 * 7 * time.Hour
+ 
++var (
++	// upstreamPingTimeout bounds the request that discovers the upstream's
++	// authentication challenge: one round trip.
++	upstreamPingTimeout = 5 * time.Second
++	// upstreamTagTimeout bounds a remote tag lookup, including its token fetch.
++	upstreamTagTimeout = 10 * time.Second
++	// upstreamRetryAfter is how long a network failure is remembered. Until it
++	// passes, cached tags are served without asking the upstream; anything not
++	// cached still asks it.
++	upstreamRetryAfter = 30 * time.Second
++)
++
+ // proxyingRegistry fetches content from a remote registry and caches it locally
+ type proxyingRegistry struct {
+ 	embedded          distribution.Namespace // provides local registry functionality
+@@ -250,6 +264,12 @@ type authChallenger interface {
+ 	tryEstablishChallenges(context.Context) error
+ 	challengeManager() challenge.Manager
+ 	credentialStore() auth.CredentialStore
++	// skipUpstream reports whether to serve a cached tag without asking the
++	// upstream: it failed to answer within the last upstreamRetryAfter, or one
++	// caller is already finding out whether it answers again.
++	skipUpstream() bool
++	// noteRemote records the outcome of a request to the upstream.
++	noteRemote(ctx context.Context, err error)
+ }
+ 
+ type remoteAuthChallenger struct {
+@@ -257,6 +277,18 @@ type remoteAuthChallenger struct {
+ 	sync.Mutex
+ 	cm challenge.Manager
+ 	cs auth.CredentialStore
++
++	ping     *pingCall // the ping in flight, shared by everyone waiting for it
++	failedAt time.Time // last network failure; zero once the upstream answers again
++	downFrom time.Time // start of the current outage, for the log
++	probing  bool      // a caller is asking the upstream after upstreamRetryAfter passed
++}
++
++// pingCall is one ping to the upstream and the callers waiting for it (a
++// singleflight; x/sync's is not vendored).
++type pingCall struct {
++	done chan struct{}
++	err  error
+ }
+ 
+ func (r *remoteAuthChallenger) credentialStore() auth.CredentialStore {
+@@ -272,26 +304,115 @@ func (r *remoteAuthChallenger) challengeManager() challenge.Manager {
+ // tryEstablishChallenges will attempt to get a challenge type for the upstream if none currently exist
+ func (r *remoteAuthChallenger) tryEstablishChallenges(ctx context.Context) error {
+ 	r.Lock()
+-	defer r.Unlock()
+-
+ 	remoteURL := r.remoteURL
+ 	remoteURL.Path = "/v2/"
+ 	challenges, err := r.cm.GetChallenges(remoteURL)
+ 	if err != nil {
++		r.Unlock()
+ 		return err
+ 	}
+ 
+ 	if len(challenges) > 0 {
++		r.Unlock()
+ 		return nil
+ 	}
+ 
+-	// establish challenge type with upstream
+-	if err := ping(r.cm, remoteURL.String(), challengeHeader); err != nil {
+-		return err
++	// establish challenge type with upstream, once for all concurrent callers
++	call := r.ping
++	if call == nil {
++		call = &pingCall{done: make(chan struct{})}
++		r.ping = call
++		// Detached from the caller: one client hanging up must not fail the
++		// others. ping bounds it with upstreamPingTimeout.
++		go r.runPing(context.WithoutCancel(ctx), remoteURL, call)
++	}
++	r.Unlock()
++
++	select {
++	case <-call.done:
++		return call.err
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++func (r *remoteAuthChallenger) runPing(ctx context.Context, remoteURL url.URL, call *pingCall) {
++	err := ping(ctx, r.cm, remoteURL.String(), challengeHeader)
++	if err == nil {
++		dcontext.GetLogger(ctx).Infof("Challenge established with upstream: %s", remoteURL.Redacted())
++	}
++
++	r.Lock()
++	r.ping = nil
++	r.recordLocked(ctx, err)
++	r.Unlock()
++
++	call.err = err
++	close(call.done)
++}
++
++func (r *remoteAuthChallenger) skipUpstream() bool {
++	r.Lock()
++	defer r.Unlock()
++	if r.failedAt.IsZero() {
++		return false
++	}
++	if r.downLocked() || r.probing {
++		return true
++	}
++	// The memory has expired. One caller asks the upstream; the rest keep
++	// serving the cache until it reports, rather than all waiting on it.
++	r.probing = true
++	return false
++}
++
++func (r *remoteAuthChallenger) downLocked() bool {
++	return !r.failedAt.IsZero() && time.Since(r.failedAt) < upstreamRetryAfter
++}
++
++func (r *remoteAuthChallenger) noteRemote(ctx context.Context, err error) {
++	r.Lock()
++	defer r.Unlock()
++	r.recordLocked(ctx, err)
++}
++
++// recordLocked is noteRemote with r locked. A success clears the failure; an
++// HTTP error changes nothing; a network failure marks the upstream down.
++func (r *remoteAuthChallenger) recordLocked(ctx context.Context, err error) {
++	r.probing = false
++	switch {
++	case err == nil:
++		if !r.failedAt.IsZero() {
++			dcontext.GetLogger(ctx).Infof("Upstream %s reachable again after %s", r.remoteURL.Redacted(), time.Since(r.downFrom).Round(time.Second))
++			r.failedAt = time.Time{}
++		}
++	case upstreamUnreachable(err):
++		if r.failedAt.IsZero() {
++			r.downFrom = time.Now()
++		}
++		if !r.downLocked() {
++			dcontext.GetLogger(ctx).Warnf("Upstream %s unreachable, serving cached tags without asking it for %s: %v", r.remoteURL.Redacted(), upstreamRetryAfter, err)
++		}
++		r.failedAt = time.Now()
+ 	}
+-	dcontext.GetLogger(ctx).Infof("Challenge established with upstream: %s", remoteURL.Redacted())
++}
+ 
+-	return nil
++// upstreamUnreachable reports whether err means the upstream could not be
++// reached: a timeout, a refused or unroutable connection, or a DNS failure.
++// An HTTP error, however wrapped, means it was reached: *url.Error implements
++// net.Error, so only Timeout() counts.
++func upstreamUnreachable(err error) bool {
++	if err == nil {
++		return false
++	}
++	var (
++		opErr  *net.OpError
++		dnsErr *net.DNSError
++		netErr net.Error
++	)
++	return errors.Is(err, context.DeadlineExceeded) ||
++		errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
++		(errors.As(err, &netErr) && netErr.Timeout())
+ }
+ 
+ // proxiedRepository uses proxying blob and manifest services to serve content
+diff --git a/registry/proxy/proxytagservice.go b/registry/proxy/proxytagservice.go
+index e126a91..a7e72ef 100644
+--- a/registry/proxy/proxytagservice.go
++++ b/registry/proxy/proxytagservice.go
+@@ -19,27 +19,50 @@ var _ distribution.TagService = proxyTagService{}
+ 
+ // Get attempts to get the most recent digest for the tag by checking the remote
+ // tag service first and then caching it locally.  If the remote is unavailable
+-// the local association is returned
++// the local association is returned. While the remote is known to be
++// unreachable, a local association is returned without asking it.
+ func (pt proxyTagService) Get(ctx context.Context, tag string) (v1.Descriptor, error) {
+-	err := pt.authChallenger.tryEstablishChallenges(ctx)
+-	if err == nil {
+-		desc, err := pt.remoteTags.Get(ctx, tag)
+-		if err == nil {
+-			err := pt.localTags.Tag(ctx, tag, desc)
+-			if err != nil {
+-				return v1.Descriptor{}, err
+-			}
++	if pt.authChallenger.skipUpstream() {
++		if desc, err := pt.localTags.Get(ctx, tag); err == nil {
+ 			return desc, nil
+ 		}
+ 	}
+ 
+-	desc, err := pt.localTags.Get(ctx, tag)
++	var desc v1.Descriptor
++	err := pt.remote(ctx, func(ctx context.Context) (err error) {
++		desc, err = pt.remoteTags.Get(ctx, tag)
++		return err
++	})
++	if err == nil {
++		err := pt.localTags.Tag(ctx, tag, desc)
++		if err != nil {
++			return v1.Descriptor{}, err
++		}
++		return desc, nil
++	}
++
++	desc, err = pt.localTags.Get(ctx, tag)
+ 	if err != nil {
+ 		return v1.Descriptor{}, err
+ 	}
+ 	return desc, nil
+ }
+ 
++// remote runs f, a lookup of one tag, once the upstream's challenge is known,
++// bounded by upstreamTagTimeout, and records whether the upstream answered.
++// The bound is the only cancellation: a client that hangs up first must not
++// keep the outage from being noticed.
++func (pt proxyTagService) remote(ctx context.Context, f func(context.Context) error) error {
++	if err := pt.authChallenger.tryEstablishChallenges(ctx); err != nil {
++		return err
++	}
++	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upstreamTagTimeout)
++	defer cancel()
++	err := f(rctx)
++	pt.authChallenger.noteRemote(ctx, err)
++	return err
++}
++
+ func (pt proxyTagService) Tag(ctx context.Context, tag string, desc v1.Descriptor) error {
+ 	return distribution.ErrUnsupported
+ }
+@@ -53,6 +76,12 @@ func (pt proxyTagService) Untag(ctx context.Context, tag string) error {
+ }
+ 
+ func (pt proxyTagService) All(ctx context.Context) ([]string, error) {
++	if pt.authChallenger.skipUpstream() {
++		if tags, err := pt.localTags.All(ctx); err == nil {
++			return tags, nil
++		}
++	}
++
+ 	err := pt.authChallenger.tryEstablishChallenges(ctx)
+ 	if err == nil {
+ 		tags, err := pt.remoteTags.All(ctx)
+@@ -68,6 +97,12 @@ func (pt proxyTagService) Lookup(ctx context.Context, digest v1.Descriptor) ([]s
+ }
+ 
+ func (pt proxyTagService) List(ctx context.Context, limit int, last string) ([]string, error) {
++	if pt.authChallenger.skipUpstream() {
++		if tags, err := pt.localTags.List(ctx, limit, last); err == nil || err == io.EOF {
++			return tags, err
++		}
++	}
++
+ 	err := pt.authChallenger.tryEstablishChallenges(ctx)
+ 	if err == nil {
+ 		tags, err := pt.remoteTags.List(ctx, limit, last)
+diff --git a/registry/proxy/proxyupstream_test.go b/registry/proxy/proxyupstream_test.go
+new file mode 100644
+index 0000000..4b6b429
+--- /dev/null
++++ b/registry/proxy/proxyupstream_test.go
+@@ -0,0 +1,623 @@
++package proxy
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"sort"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/distribution/distribution/v3"
++	"github.com/distribution/distribution/v3/internal/client/auth/challenge"
++	"github.com/distribution/distribution/v3/registry/storage"
++	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
++	"github.com/distribution/reference"
++	"github.com/opencontainers/go-digest"
++	v1 "github.com/opencontainers/image-spec/specs-go/v1"
++)
++
++// fakeUpstream is a token-authenticated registry that can stop answering.
++type fakeUpstream struct {
++	srv *httptest.Server
++
++	hang      atomic.Bool // handlers block until the client gives up
++	hangToken atomic.Bool // only the token endpoint does
++	listDelay time.Duration
++	status    atomic.Int32 // if set, manifests get this status instead of 200
++	pings     atomic.Int32
++	requests  atomic.Int32
++
++	mu   sync.Mutex
++	tags map[string]digest.Digest
++}
++
++func newFakeUpstream(t *testing.T) *fakeUpstream {
++	t.Helper()
++	f := &fakeUpstream{tags: map[string]digest.Digest{"latest": digest.FromString("v1")}}
++	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		f.requests.Add(1)
++		if f.hang.Load() {
++			<-r.Context().Done()
++			return
++		}
++		switch {
++		case r.URL.Path == "/v2/":
++			f.pings.Add(1)
++			w.Header().Set("WWW-Authenticate", `Bearer realm="`+f.srv.URL+`/token",service="fake"`)
++			w.WriteHeader(http.StatusUnauthorized)
++		case r.URL.Path == "/token":
++			if f.hangToken.Load() {
++				<-r.Context().Done()
++				return
++			}
++			_, _ = io.WriteString(w, `{"token":"t","expires_in":300}`)
++		case strings.HasSuffix(r.URL.Path, "/tags/list"):
++			if r.Header.Get("Authorization") != "Bearer t" {
++				w.WriteHeader(http.StatusUnauthorized)
++				return
++			}
++			time.Sleep(f.listDelay)
++			f.mu.Lock()
++			names := make([]string, 0, len(f.tags))
++			for name := range f.tags {
++				names = append(names, name)
++			}
++			f.mu.Unlock()
++			sort.Strings(names)
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = fmt.Fprintf(w, `{"name":"library/test","tags":["%s"]}`, strings.Join(names, `","`))
++		case strings.Contains(r.URL.Path, "/manifests/"):
++			if r.Header.Get("Authorization") != "Bearer t" {
++				w.WriteHeader(http.StatusUnauthorized)
++				return
++			}
++			if s := f.status.Load(); s != 0 {
++				w.WriteHeader(int(s))
++				return
++			}
++			f.mu.Lock()
++			dgst, ok := f.tags[r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]]
++			f.mu.Unlock()
++			if !ok {
++				w.WriteHeader(http.StatusNotFound)
++				return
++			}
++			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
++			w.Header().Set("Docker-Content-Digest", dgst.String())
++			w.Header().Set("Content-Length", "2")
++			w.WriteHeader(http.StatusOK)
++			if r.Method != http.MethodHead {
++				_, _ = io.WriteString(w, "{}")
++			}
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	t.Cleanup(f.srv.Close)
++	return f
++}
++
++func (f *fakeUpstream) setTag(tag string, dgst digest.Digest) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.tags[tag] = dgst
++}
++
++// upstreamTestEnv is a proxy in front of fakeUpstream. restart returns a proxy
++// over the same local storage with an empty challenge manager, as a restarted
++// registry has.
++type upstreamTestEnv struct {
++	t           *testing.T
++	upstream    *fakeUpstream
++	local       distribution.Namespace
++	ctx         context.Context
++	challengers []*remoteAuthChallenger
++}
++
++func newUpstreamTestEnv(t *testing.T) *upstreamTestEnv {
++	t.Helper()
++	shortUpstreamTimeouts(t)
++	ctx := context.Background()
++	local, err := storage.NewRegistry(ctx, inmemory.New())
++	if err != nil {
++		t.Fatal(err)
++	}
++	e := &upstreamTestEnv{t: t, upstream: newFakeUpstream(t), local: local, ctx: ctx}
++	// A ping outlives the caller that started it; let it finish before the
++	// timeouts are restored and the upstream is closed.
++	t.Cleanup(e.waitForPings)
++	return e
++}
++
++func (e *upstreamTestEnv) waitForPings() {
++	deadline := time.Now().Add(oneTimeout)
++	for _, c := range e.challengers {
++		for {
++			c.Lock()
++			inflight := c.ping != nil
++			c.Unlock()
++			if !inflight || time.Now().After(deadline) {
++				break
++			}
++			time.Sleep(5 * time.Millisecond)
++		}
++	}
++}
++
++// shortUpstreamTimeouts makes waiting on the upstream take milliseconds.
++func shortUpstreamTimeouts(t *testing.T) {
++	t.Helper()
++	ping, tag, retry := upstreamPingTimeout, upstreamTagTimeout, upstreamRetryAfter
++	// retry: long enough that a test finishes its steps while still down.
++	upstreamPingTimeout, upstreamTagTimeout, upstreamRetryAfter = 200*time.Millisecond, 200*time.Millisecond, 5*time.Second
++	t.Cleanup(func() { upstreamPingTimeout, upstreamTagTimeout, upstreamRetryAfter = ping, tag, retry })
++}
++
++func (e *upstreamTestEnv) restart() (distribution.TagService, *remoteAuthChallenger) {
++	e.t.Helper()
++	u, err := url.Parse(e.upstream.srv.URL)
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	c := &remoteAuthChallenger{remoteURL: *u, cm: challenge.NewSimpleManager(), cs: credentials{}}
++	e.challengers = append(e.challengers, c)
++	return e.request(c), c
++}
++
++// request returns the tag service a new HTTP request would get: a new
++// repository, with its own token handler, sharing the registry's challenger.
++func (e *upstreamTestEnv) request(c *remoteAuthChallenger) distribution.TagService {
++	e.t.Helper()
++	pr := &proxyingRegistry{embedded: e.local, remoteURL: c.remoteURL, authChallenger: c, basicAuth: userpass{}}
++	name, _ := reference.WithName("library/test")
++	repo, err := pr.Repository(e.ctx, name)
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	return repo.Tags(e.ctx)
++}
++
++// warm pulls the tag while the upstream answers, so it is cached locally.
++func (e *upstreamTestEnv) warm(tags distribution.TagService, tag string) digest.Digest {
++	e.t.Helper()
++	desc, err := tags.Get(e.ctx, tag)
++	if err != nil {
++		e.t.Fatalf("warm-up Get: %v", err)
++	}
++	return desc.Digest
++}
++
++// upstreamDown reports whether a network failure is currently remembered,
++// without the probe bookkeeping of skipUpstream.
++func (r *remoteAuthChallenger) upstreamDown() bool {
++	r.Lock()
++	defer r.Unlock()
++	return r.downLocked()
++}
++
++func timed(t *testing.T, f func()) time.Duration {
++	t.Helper()
++	start := time.Now()
++	f()
++	return time.Since(start)
++}
++
++// A bound on how long an operation that waits out one upstream timeout may
++// take, generous for -race and slow CI.
++const oneTimeout = 2 * time.Second
++
++func TestCachedTagServedAfterRestartWhileUpstreamHangs(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, _ := env.restart()
++	want := env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	tags, c := env.restart()
++	before := env.upstream.requests.Load()
++
++	var desc v1.Descriptor
++	var err error
++	took := timed(t, func() { desc, err = tags.Get(env.ctx, "latest") })
++	if err != nil || desc.Digest != want {
++		t.Fatalf("Get: %v, digest %s, want %s", err, desc.Digest, want)
++	}
++	if took > oneTimeout {
++		t.Fatalf("Get took %s, want at most one upstream timeout", took)
++	}
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down after the ping timed out")
++	}
++	if got := env.upstream.requests.Load() - before; got != 1 {
++		t.Fatalf("upstream got %d requests, want 1 (the ping)", got)
++	}
++}
++
++func TestConcurrentCallersShareOnePing(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, _ := env.restart()
++	want := env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	tags, _ = env.restart()
++	before := env.upstream.requests.Load()
++
++	const n = 5
++	var wg sync.WaitGroup
++	errs := make([]error, n)
++	took := timed(t, func() {
++		for i := range n {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				desc, err := tags.Get(env.ctx, "latest")
++				if err == nil && desc.Digest != want {
++					err = fmt.Errorf("digest %s, want %s", desc.Digest, want)
++				}
++				errs[i] = err
++			}()
++		}
++		wg.Wait()
++	})
++	for i, err := range errs {
++		if err != nil {
++			t.Errorf("caller %d: %v", i, err)
++		}
++	}
++	if took > oneTimeout {
++		t.Fatalf("%d concurrent Gets took %s, want at most one upstream timeout", n, took)
++	}
++	if got := env.upstream.requests.Load() - before; got != 1 {
++		t.Fatalf("upstream got %d requests, want 1 shared ping", got)
++	}
++}
++
++func TestCachedTagServedWithoutUpstreamWhileDown(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	want := env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	var desc v1.Descriptor
++	var err error
++	took := timed(t, func() { desc, err = tags.Get(env.ctx, "latest") })
++	if err != nil || desc.Digest != want {
++		t.Fatalf("Get during outage: %v, digest %s, want %s", err, desc.Digest, want)
++	}
++	if took > oneTimeout {
++		t.Fatalf("Get took %s, want at most one upstream timeout", took)
++	}
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down after the lookup timed out")
++	}
++
++	before := env.upstream.requests.Load()
++	took = timed(t, func() { desc, err = tags.Get(env.ctx, "latest") })
++	if err != nil || desc.Digest != want {
++		t.Fatalf("Get: %v, digest %s, want %s", err, desc.Digest, want)
++	}
++	if took > oneTimeout {
++		t.Fatalf("Get took %s while upstream is known to be down", took)
++	}
++	if got := env.upstream.requests.Load() - before; got != 0 {
++		t.Fatalf("upstream got %d requests while known to be down, want 0", got)
++	}
++
++	// Once the failure is forgotten, the upstream is asked again.
++	upstreamRetryAfter = 0
++	if _, err := tags.Get(env.ctx, "latest"); err != nil {
++		t.Fatalf("Get after retry window: %v", err)
++	}
++	if got := env.upstream.requests.Load() - before; got == 0 {
++		t.Fatal("upstream was not asked again after the retry window")
++	}
++}
++
++// When the memory expires during a long outage, one caller asks the upstream
++// and the others keep serving the cache, so they don't all wait on it.
++func TestOneProbeAfterRetryWindow(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	want := env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	_, _ = tags.Get(env.ctx, "latest")
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down")
++	}
++	c.Lock()
++	c.failedAt = time.Now().Add(-upstreamRetryAfter) // the memory has just expired
++	c.Unlock()
++	before := env.upstream.requests.Load()
++
++	const n = 5
++	var wg sync.WaitGroup
++	slow := make([]bool, n)
++	for i := range n {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			var desc v1.Descriptor
++			var err error
++			took := timed(t, func() { desc, err = tags.Get(env.ctx, "latest") })
++			if err != nil || desc.Digest != want {
++				t.Errorf("caller %d: %v, digest %s, want %s", i, err, desc.Digest, want)
++			}
++			slow[i] = took >= upstreamTagTimeout
++		}()
++	}
++	wg.Wait()
++	var probes int
++	for _, s := range slow {
++		if s {
++			probes++
++		}
++	}
++	if probes != 1 {
++		t.Fatalf("%d callers waited on the upstream, want 1", probes)
++	}
++	if got := env.upstream.requests.Load() - before; got != 1 {
++		t.Fatalf("upstream got %d requests, want 1 probe", got)
++	}
++	if !c.upstreamDown() {
++		t.Fatal("the failed probe was not remembered")
++	}
++}
++
++// Each request to the proxy gets its own token handler, so each fetches a
++// token; a hanging token server must not stall a cached tag past the lookup
++// bound.
++func TestHangingTokenServerIsBounded(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	want := env.warm(tags, "latest")
++
++	env.upstream.hangToken.Store(true)
++	tags = env.request(c)
++	var desc v1.Descriptor
++	var err error
++	took := timed(t, func() { desc, err = tags.Get(env.ctx, "latest") })
++	if err != nil || desc.Digest != want {
++		t.Fatalf("Get: %v, digest %s, want %s", err, desc.Digest, want)
++	}
++	if took > oneTimeout {
++		t.Fatalf("Get took %s, want at most one upstream timeout", took)
++	}
++	if !c.upstreamDown() {
++		t.Fatal("a hanging token server was not remembered as an unreachable upstream")
++	}
++}
++
++// List is what the tags API calls.
++func TestListServedLocallyWhileDown(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	_, _ = tags.Get(env.ctx, "latest")
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down")
++	}
++	before := env.upstream.requests.Load()
++	list, err := tags.List(env.ctx, 10, "")
++	if (err != nil && err != io.EOF) || len(list) != 1 || list[0] != "latest" {
++		t.Fatalf("List: %v, %v; want the cached tag", list, err)
++	}
++	if got := env.upstream.requests.Load() - before; got != 0 {
++		t.Fatalf("List asked the upstream %d times while known to be down", got)
++	}
++}
++
++// After a restart during an outage the memory is set by the ping; the first
++// successful ping clears it.
++func TestSuccessfulPingClearsFailure(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, _ := env.restart()
++	env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	tags, c := env.restart()
++	_, _ = tags.Get(env.ctx, "latest")
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down after the ping timed out")
++	}
++
++	env.upstream.hang.Store(false)
++	if _, err := tags.Get(env.ctx, "missing"); err == nil {
++		t.Fatal("Get of a missing tag succeeded")
++	}
++	if c.upstreamDown() {
++		t.Fatal("still down after a successful ping")
++	}
++}
++
++func TestUncachedTagStillAsksUpstreamWhileDown(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	_, _ = tags.Get(env.ctx, "latest")
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down")
++	}
++
++	before := env.upstream.requests.Load()
++	_, err := tags.Get(env.ctx, "missing")
++	if _, ok := err.(distribution.ErrTagUnknown); !ok {
++		t.Fatalf("Get of an uncached tag: %v (%T), want ErrTagUnknown unwrapped", err, err)
++	}
++	if got := env.upstream.requests.Load() - before; got == 0 {
++		t.Fatal("uncached tag was answered without asking the upstream")
++	}
++}
++
++func TestSuccessClearsFailureImmediately(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	_, _ = tags.Get(env.ctx, "latest")
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down")
++	}
++
++	env.upstream.hang.Store(false)
++	env.upstream.setTag("other", digest.FromString("other"))
++	if _, err := tags.Get(env.ctx, "other"); err != nil {
++		t.Fatalf("Get after recovery: %v", err)
++	}
++	if c.upstreamDown() {
++		t.Fatal("still down after a successful request")
++	}
++
++	// A cached tag is now looked up upstream again and picks up a change.
++	changed := digest.FromString("v2")
++	env.upstream.setTag("latest", changed)
++	desc, err := tags.Get(env.ctx, "latest")
++	if err != nil || desc.Digest != changed {
++		t.Fatalf("Get after recovery: %v, digest %s, want %s", err, desc.Digest, changed)
++	}
++}
++
++// A client whose own timeout is shorter than the lookup bound must not keep
++// the outage from being noticed: the lookup runs to its bound regardless.
++func TestCallerGivingUpStillRecordsOutage(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	want := env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	ctx, cancel := context.WithCancel(env.ctx)
++	go func() {
++		time.Sleep(20 * time.Millisecond)
++		cancel()
++	}()
++	desc, err := tags.Get(ctx, "latest")
++	if err != nil || desc.Digest != want {
++		t.Fatalf("Get: %v, digest %s, want %s", err, desc.Digest, want)
++	}
++	if !c.upstreamDown() {
++		t.Fatal("the outage was not recorded because the caller gave up")
++	}
++}
++
++// A listing is not bounded: a big repository can legitimately take longer
++// than a single lookup, and must not be cut down to what is cached.
++func TestSlowListingIsNotTruncated(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	env.warm(tags, "latest")
++	env.upstream.setTag("other", digest.FromString("other"))
++
++	env.upstream.listDelay = 2 * upstreamTagTimeout
++	all, err := tags.All(env.ctx)
++	if err != nil || len(all) != 2 {
++		t.Fatalf("All: %v, %v; want both remote tags", all, err)
++	}
++	if c.upstreamDown() {
++		t.Fatal("a slow listing marked the upstream down")
++	}
++}
++
++func TestHTTPErrorDoesNotMarkUpstreamDown(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	want := env.warm(tags, "latest")
++
++	for _, status := range []int32{http.StatusInternalServerError, http.StatusUnauthorized} {
++		env.upstream.status.Store(status)
++		desc, err := tags.Get(env.ctx, "latest")
++		if err != nil || desc.Digest != want {
++			t.Fatalf("status %d: Get: %v, digest %s, want the cached %s", status, err, desc.Digest, want)
++		}
++		if c.upstreamDown() {
++			t.Fatalf("status %d marked the upstream down", status)
++		}
++	}
++}
++
++// One caller giving up on the shared ping must not fail the others, and the
++// ping must still record its result.
++func TestPingOutlivesCallerThatGaveUp(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, _ := env.restart()
++	want := env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	tags, c := env.restart()
++	ctx, cancel := context.WithCancel(env.ctx)
++	go func() {
++		time.Sleep(20 * time.Millisecond)
++		cancel()
++	}()
++
++	var patient v1.Descriptor
++	var patientErr error
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		patient, patientErr = tags.Get(env.ctx, "latest")
++	}()
++
++	var err error
++	took := timed(t, func() { _, err = tags.Get(ctx, "missing") })
++	if _, ok := err.(distribution.ErrTagUnknown); !ok {
++		t.Fatalf("Get: %v (%T), want ErrTagUnknown from the local fallback", err, err)
++	}
++	if took >= upstreamPingTimeout {
++		t.Fatalf("Get took %s: the caller waited for the ping instead of returning when it gave up", took)
++	}
++	if c.upstreamDown() {
++		t.Fatal("marked down before the ping finished")
++	}
++
++	wg.Wait()
++	if patientErr != nil || patient.Digest != want {
++		t.Fatalf("the caller that waited got %v, digest %s, want %s", patientErr, patient.Digest, want)
++	}
++	if !c.upstreamDown() {
++		t.Fatal("the detached ping did not record its failure")
++	}
++	if n := env.upstream.pings.Load(); n != 1 {
++		t.Fatalf("upstream saw %d pings, want the warm-up one only (the outage ping hangs before counting)", n)
++	}
++}
++
++func TestUpstreamUnreachable(t *testing.T) {
++	for name, tc := range map[string]struct {
++		err  error
++		want bool
++	}{
++		"nil":                       {nil, false},
++		"deadline":                  {context.DeadlineExceeded, true},
++		"wrapped deadline":          {&url.Error{Op: "Get", Err: &url.Error{Op: "Get", Err: context.DeadlineExceeded}}, true},
++		"dial refused":              {&url.Error{Op: "Get", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}, true},
++		"dns":                       {&url.Error{Op: "Get", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}, true},
++		"client timeout":            {&url.Error{Op: "Get", Err: &timeoutErr{}}, true},
++		"http error":                {errors.New("unexpected status code 500 Internal Server Error"), false},
++		"token error via transport": {&url.Error{Op: "Head", Err: errors.New("authorization server did not include a token in the response")}, false},
++		"canceled":                  {&url.Error{Op: "Get", Err: context.Canceled}, false},
++	} {
++		if got := upstreamUnreachable(tc.err); got != tc.want {
++			t.Errorf("%s: got %v, want %v", name, got, tc.want)
++		}
++	}
++}
++
++type timeoutErr struct{}
++
++func (*timeoutErr) Error() string   { return "i/o timeout" }
++func (*timeoutErr) Timeout() bool   { return true }
++func (*timeoutErr) Temporary() bool { return true }

@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	// GlueOps: the only change from upstream. See transport.go.
+	// GlueOps: the only change to this file. See transport.go and patches/.
 	transport.DefaultTransportWrapper = wrapBlobHeadFallback
 
 	// NOTE(milosgajdos): if the only two commands registered

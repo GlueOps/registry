@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   release-please:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       # Authenticate with the public-release-please GitHub App (NOT GITHUB_TOKEN).
       # App installation tokens trigger downstream workflows (so the release tag

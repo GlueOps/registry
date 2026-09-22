@@ -21,7 +21,7 @@ jobs:
   build_tag_push_to_ghcr:
     # A PR from this repo is already built by its push run; only fork PRs build here.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -95,7 +95,7 @@ jobs:
   # The image build runs the tests without cgo; this runs them with -race.
   race_tests:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:

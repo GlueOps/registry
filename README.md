@@ -75,7 +75,7 @@ Things to know (upstream and ECR behaviour):
 - **Credentials**: anyone who can reach the registry can pull anything the configured
   account can pull.
 - **Timeouts**: an upstream that stops responding mid-transfer can still stall uncached
-  pulls. Manifest and blob fetches are bounded only by the connection itself.
+  pulls.
 - **`proxy.exec` during an outage**: the helper is not bounded by the timeouts above and
   runs one at a time. Without `lifetime` it runs once; with it, again after each expiry,
   and a failed run is retried on every token fetch. A helper that itself needs the network

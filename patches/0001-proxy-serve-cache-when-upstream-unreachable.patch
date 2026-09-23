@@ -43,14 +43,18 @@ index 23b1e90..06993ca 100644
  		return err
  	}
 diff --git a/registry/proxy/proxymanifeststore_test.go b/registry/proxy/proxymanifeststore_test.go
-index 063d805..0243a9f 100644
+index 063d805..d149971 100644
 --- a/registry/proxy/proxymanifeststore_test.go
 +++ b/registry/proxy/proxymanifeststore_test.go
-@@ -83,6 +83,13 @@ func (m *mockChallenger) challengeManager() challenge.Manager {
+@@ -83,6 +83,17 @@ func (m *mockChallenger) challengeManager() challenge.Manager {
  	return nil
  }
  
 +func (m *mockChallenger) skipUpstream() bool {
++	return false
++}
++
++func (m *mockChallenger) upstreamDown() bool {
 +	return false
 +}
 +
@@ -61,7 +65,7 @@ index 063d805..0243a9f 100644
  	nameRef, err := reference.WithName(name)
  	if err != nil {
 diff --git a/registry/proxy/proxyregistry.go b/registry/proxy/proxyregistry.go
-index e85663e..23d09ba 100644
+index e85663e..3e47d48 100644
 --- a/registry/proxy/proxyregistry.go
 +++ b/registry/proxy/proxyregistry.go
 @@ -2,7 +2,9 @@ package proxy
@@ -93,20 +97,25 @@ index e85663e..23d09ba 100644
  // proxyingRegistry fetches content from a remote registry and caches it locally
  type proxyingRegistry struct {
  	embedded          distribution.Namespace // provides local registry functionality
-@@ -250,6 +264,12 @@ type authChallenger interface {
+@@ -250,6 +264,17 @@ type authChallenger interface {
  	tryEstablishChallenges(context.Context) error
  	challengeManager() challenge.Manager
  	credentialStore() auth.CredentialStore
 +	// skipUpstream reports whether to serve a cached tag without asking the
 +	// upstream: it failed to answer within the last upstreamRetryAfter, or one
-+	// caller is already finding out whether it answers again.
++	// caller is already finding out whether it answers again. Once the memory
++	// has expired, the first caller gets false and becomes that caller: it
++	// must report through noteRemote.
 +	skipUpstream() bool
++	// upstreamDown is skipUpstream for callers that don't report through
++	// noteRemote (listings): they never become the caller that asks.
++	upstreamDown() bool
 +	// noteRemote records the outcome of a request to the upstream.
 +	noteRemote(ctx context.Context, err error)
  }
  
  type remoteAuthChallenger struct {
-@@ -257,6 +277,18 @@ type remoteAuthChallenger struct {
+@@ -257,6 +282,18 @@ type remoteAuthChallenger struct {
  	sync.Mutex
  	cm challenge.Manager
  	cs auth.CredentialStore
@@ -125,7 +134,7 @@ index e85663e..23d09ba 100644
  }
  
  func (r *remoteAuthChallenger) credentialStore() auth.CredentialStore {
-@@ -272,26 +304,115 @@ func (r *remoteAuthChallenger) challengeManager() challenge.Manager {
+@@ -272,26 +309,122 @@ func (r *remoteAuthChallenger) challengeManager() challenge.Manager {
  // tryEstablishChallenges will attempt to get a challenge type for the upstream if none currently exist
  func (r *remoteAuthChallenger) tryEstablishChallenges(ctx context.Context) error {
  	r.Lock()
@@ -196,6 +205,12 @@ index e85663e..23d09ba 100644
 +	return false
 +}
 +
++func (r *remoteAuthChallenger) upstreamDown() bool {
++	r.Lock()
++	defer r.Unlock()
++	return r.downLocked() || r.probing
++}
++
 +func (r *remoteAuthChallenger) downLocked() bool {
 +	return !r.failedAt.IsZero() && time.Since(r.failedAt) < upstreamRetryAfter
 +}
@@ -206,8 +221,9 @@ index e85663e..23d09ba 100644
 +	r.recordLocked(ctx, err)
 +}
 +
-+// recordLocked is noteRemote with r locked. A success clears the failure; an
-+// HTTP error changes nothing; a network failure marks the upstream down.
++// recordLocked is noteRemote with r locked. Every outcome ends the probe. A
++// success clears the failure; an HTTP error changes nothing else; a network
++// failure marks the upstream down.
 +func (r *remoteAuthChallenger) recordLocked(ctx context.Context, err error) {
 +	r.probing = false
 +	switch {
@@ -249,7 +265,7 @@ index e85663e..23d09ba 100644
  
  // proxiedRepository uses proxying blob and manifest services to serve content
 diff --git a/registry/proxy/proxytagservice.go b/registry/proxy/proxytagservice.go
-index e126a91..a7e72ef 100644
+index e126a91..6ac7080 100644
 --- a/registry/proxy/proxytagservice.go
 +++ b/registry/proxy/proxytagservice.go
 @@ -19,27 +19,50 @@ var _ distribution.TagService = proxyTagService{}
@@ -317,7 +333,7 @@ index e126a91..a7e72ef 100644
  }
  
  func (pt proxyTagService) All(ctx context.Context) ([]string, error) {
-+	if pt.authChallenger.skipUpstream() {
++	if pt.authChallenger.upstreamDown() {
 +		if tags, err := pt.localTags.All(ctx); err == nil {
 +			return tags, nil
 +		}
@@ -330,7 +346,7 @@ index e126a91..a7e72ef 100644
  }
  
  func (pt proxyTagService) List(ctx context.Context, limit int, last string) ([]string, error) {
-+	if pt.authChallenger.skipUpstream() {
++	if pt.authChallenger.upstreamDown() {
 +		if tags, err := pt.localTags.List(ctx, limit, last); err == nil || err == io.EOF {
 +			return tags, err
 +		}
@@ -341,10 +357,10 @@ index e126a91..a7e72ef 100644
  		tags, err := pt.remoteTags.List(ctx, limit, last)
 diff --git a/registry/proxy/proxyupstream_test.go b/registry/proxy/proxyupstream_test.go
 new file mode 100644
-index 0000000..4b6b429
+index 0000000..f30b439
 --- /dev/null
 +++ b/registry/proxy/proxyupstream_test.go
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,648 @@
 +package proxy
 +
 +import (
@@ -543,14 +559,6 @@ index 0000000..4b6b429
 +	return desc.Digest
 +}
 +
-+// upstreamDown reports whether a network failure is currently remembered,
-+// without the probe bookkeeping of skipUpstream.
-+func (r *remoteAuthChallenger) upstreamDown() bool {
-+	r.Lock()
-+	defer r.Unlock()
-+	return r.downLocked()
-+}
-+
 +func timed(t *testing.T, f func()) time.Duration {
 +	t.Helper()
 +	start := time.Now()
@@ -665,6 +673,39 @@ index 0000000..4b6b429
 +	}
 +	if got := env.upstream.requests.Load() - before; got == 0 {
 +		t.Fatal("upstream was not asked again after the retry window")
++	}
++}
++
++// A listing records nothing, so it must never become the prober: it would
++// hold the probe for good, and every cached tag would be served stale.
++func TestListingDoesNotProbe(t *testing.T) {
++	env := newUpstreamTestEnv(t)
++	tags, c := env.restart()
++	env.warm(tags, "latest")
++
++	env.upstream.hang.Store(true)
++	_, _ = tags.Get(env.ctx, "latest")
++	if !c.upstreamDown() {
++		t.Fatal("upstream not remembered as down")
++	}
++	c.Lock()
++	c.failedAt = time.Now().Add(-upstreamRetryAfter) // the memory has just expired
++	c.Unlock()
++
++	// A listing whose client gives up quickly: it asks the upstream, but it
++	// must not claim the probe.
++	ctx, cancel := context.WithTimeout(env.ctx, 20*time.Millisecond)
++	defer cancel()
++	if _, err := tags.List(ctx, 10, ""); err != nil && err != io.EOF {
++		t.Fatalf("List: %v", err)
++	}
++
++	env.upstream.hang.Store(false)
++	changed := digest.FromString("v2")
++	env.upstream.setTag("latest", changed)
++	desc, err := tags.Get(env.ctx, "latest")
++	if err != nil || desc.Digest != changed {
++		t.Fatalf("Get after the listing: %v, digest %s, want %s (the listing kept the probe)", err, desc.Digest, changed)
 +	}
 +}
 +

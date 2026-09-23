@@ -74,8 +74,9 @@ holds the numbers. The timeouts are package `var`s so the patch's own tests can 
 - The failure memory only decides whether to ask the upstream before serving a cached tag.
   It never turns a miss into a 404 without asking; cold fetches by digest are unchanged.
 - A successful tag lookup or ping clears the failure memory. Fetches by digest record
-  nothing either way. When the memory expires during an outage, one caller probes and the
-  rest keep serving the cache until it reports (`skipUpstream`).
+  nothing either way. When the memory expires during an outage, one tag lookup probes and
+  the rest keep serving the cache until it reports (`skipUpstream`). Listings never probe
+  (`upstreamDown`): they record nothing, so a probe they claimed would never be released.
 - Nothing is installed at build time: the patch is applied in a stage built from the
   digest-pinned `GO_TEST_IMAGE`, which has git.
 - `transport.DefaultTransportWrapper` is only applied to the proxy's upstream requests

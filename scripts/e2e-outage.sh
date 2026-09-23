@@ -131,7 +131,8 @@ run_scenario() { # run_scenario LABEL IMAGE
   slow=0
   for i in 1 2 3 4 5; do head_time "$manifest_path" > "$tmp/head.$i" & done; wait
   for i in 1 2 3 4 5; do awk -v s="$(cat "$tmp/head.$i")" 'BEGIN{exit !(s+0 >= 1)}' && slow=$((slow + 1)); done
-  expect "5 concurrent HEADs after the memory expired: waited on upstream" "$slow" 1
+  echo "   5 concurrent HEADs after the memory expired: $(for i in 1 2 3 4 5; do cat "$tmp/head.$i"; echo; done | sort -n | awk '{printf "%.1fs ", $1}')"
+  expect "   of which waited on upstream" "$slow" 1
 
   unblackhole
   check_pull "docker pull, uncached, after recovery" "$UNCACHED_REF" 60

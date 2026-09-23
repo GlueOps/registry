@@ -1,22 +1,34 @@
 # registry
 
-[CNCF Distribution](https://github.com/distribution/distribution) `3.1.1` with one fix, so
-the pull-through proxy works with `public.ecr.aws`. Drop-in replacement for
-`registry:3.1.1`.
+[CNCF Distribution](https://github.com/distribution/distribution) `3.1.1` with two fixes for
+the pull-through proxy: it works with `public.ecr.aws`, and it serves its cache without
+waiting on an unreachable upstream. Drop-in replacement for `registry:3.1.1`.
 
 ```
 ghcr.io/glueops/registry
 ```
 
-## Change from upstream
+## Changes from upstream
 
-ECR Public rejects `HEAD` on blobs with 401, so stock `registry:3` can't pull any uncached
-image through it ([distribution#4383](https://github.com/distribution/distribution/issues/4383)).
+**ECR Public.** It rejects `HEAD` on blobs with 401, so stock `registry:3` can't pull any
+uncached image through it ([distribution#4383](https://github.com/distribution/distribution/issues/4383)).
 This image answers that `HEAD` with a one-byte `GET` instead. If the `GET` fails too, the
-original 401 is returned, as upstream would.
+original 401 is returned, as upstream would. The fix is in [transport.go](transport.go);
+[main.go](main.go) is upstream's plus one assignment.
 
-Everything else is upstream, unmodified: [main.go](main.go) is upstream's plus one assignment,
-and the fix is in [transport.go](transport.go).
+**Unreachable upstream.** Stock `registry:3` asks the upstream before serving a cached tag,
+and waits 15s for it, or 30s per request after a restart, with concurrent requests waiting
+in line. Docker gives up at about 30s, so a mirror restarted during an upstream outage serves
+nothing ([distribution#3033](https://github.com/distribution/distribution/issues/3033),
+[#8](https://github.com/GlueOps/registry/issues/8)). This image waits at most 5s for the
+upstream's auth challenge and 10s for a tag lookup, shares one challenge request between
+concurrent callers, and for 30s after the last network failure serves cached tags without
+checking whether they moved upstream; when the 30s pass, one request checks while the rest
+keep serving the cache. Anything not cached still asks the upstream: an uncached tag
+during an outage is a 404 after 5–10s. The fix is a patch to upstream's `registry/proxy`
+package in [patches/](patches/).
+
+Everything else is upstream, unmodified.
 
 ## Usage
 
@@ -50,7 +62,7 @@ docker run -d -p 5000:5000 \
   ghcr.io/glueops/registry:<vX.Y.Z>
 ```
 
-Things to know (upstream and ECR behaviour, not changed here):
+Things to know (upstream and ECR behaviour):
 
 - **`proxy.exec`**: without it, the registry checks the upstream at startup and panics if it's
   unreachable. With it, the registry starts and serves what's cached.
@@ -62,7 +74,14 @@ Things to know (upstream and ECR behaviour, not changed here):
   never refreshed.
 - **Credentials**: anyone who can reach the registry can pull anything the configured
   account can pull.
-- **Timeouts**: an upstream that stops responding can stall pulls.
+- **Timeouts**: an upstream that stops responding mid-transfer can still stall uncached
+  pulls.
+- **`proxy.exec` during an outage**: the helper is not bounded by the timeouts above and
+  runs one at a time. Without `lifetime` it runs once; with it, again after each expiry,
+  and a failed run is retried on every token fetch. A helper that itself needs the network
+  (`aws ecr-public get-login-password`) stalls every request that fetches a token, including
+  the one that discovers an outage, for as long as the helper takes to fail. Keep it quick,
+  or have it return cached credentials when the network is down.
 
 ## Images
 

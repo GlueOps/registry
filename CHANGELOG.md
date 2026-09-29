@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.3](https://github.com/GlueOps/registry/compare/v0.0.2...v0.0.3) (2026-09-29)
+
+
+### Bug Fixes
+
+* serve cached images without waiting on an unreachable upstream ([#9](https://github.com/GlueOps/registry/issues/9)) ([74e22df](https://github.com/GlueOps/registry/commit/74e22df45b0813c87ad73b36e9b58135f65eaa69))
+
 ## [0.0.2](https://github.com/GlueOps/registry/compare/v0.0.1...v0.0.2) (2026-09-22)
 
 

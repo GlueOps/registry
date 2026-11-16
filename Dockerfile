@@ -4,7 +4,7 @@
 ARG DISTRIBUTION_COMMIT=9a8d98b679740cd514aa7e7d84d23d442a5ef54c
 # Same Go on glibc, for -race (needs cgo); used by scripts/test.sh. It has git,
 # so it also applies the patch: the alpine image has neither git nor patch.
-ARG GO_TEST_IMAGE=golang:1.25.9-trixie@sha256:e31c2b19d37ddc2a558bafa599ec54a11443affd0623f653d23b75ab28022a90
+ARG GO_TEST_IMAGE=golang:1.27.4-trixie@sha256:f18c3d73a184fb0582828510722e723b63a93f7188d11dd223d9be6f6880e65d
 
 FROM --platform=$BUILDPLATFORM ${GO_TEST_IMAGE} AS src
 ARG DISTRIBUTION_COMMIT
@@ -14,7 +14,7 @@ COPY patches/ /patches/
 RUN cd /src && git apply /patches/*.patch
 
 # Matches upstream's GO_VERSION / ALPINE_VERSION at the pinned release.
-FROM --platform=$BUILDPLATFORM golang:1.25.9-alpine3.23@sha256:5caaf1cca9dc351e13deafbc3879fd4754801acba8653fa9540cea125d01a71f AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine3.23@sha256:f70850ef6ce341e8b6427f677049145d63c0b7ce002d4d7e3d464828b1b96dcd AS build
 COPY --from=src /src /src
 WORKDIR /src
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
